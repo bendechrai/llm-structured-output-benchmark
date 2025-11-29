@@ -27,10 +27,18 @@ export interface AttemptResult {
   errorMessage: string | null;
 }
 
+export interface StepResult {
+  stepNumber: number;
+  stepName: string;
+  success: boolean;
+  attempts: AttemptResult[];
+}
+
 export interface RunResult {
   runNumber: number;
   success: boolean;
   attempts: AttemptResult[];
+  steps?: StepResult[];
   totalDurationMs: number;
   finalResponse: Record<string, unknown> | null;
 }
@@ -45,6 +53,8 @@ export interface ScenarioResult {
     afterRetry3SuccessRate: number;
     averageDurationMs: number;
     averageAttempts: number;
+    averageAttemptsPerSuccess: number;
+    averageTokensPerSuccess: number;
     totalTokensUsed: number;
   };
 }
@@ -233,7 +243,7 @@ export function getAllRuns(): TestRunFile[] {
 }
 
 // Calculate scenario summary from runs
-export function calculateScenarioSummary(runs: RunResult[]): ScenarioResult['summary'] {
+export function calculateScenarioSummary(runs: RunResult[], isSequential: boolean = false): ScenarioResult['summary'] {
   const totalRuns = runs.length;
   if (totalRuns === 0) {
     return {
@@ -244,50 +254,102 @@ export function calculateScenarioSummary(runs: RunResult[]): ScenarioResult['sum
       afterRetry3SuccessRate: 0,
       averageDurationMs: 0,
       averageAttempts: 0,
+      averageAttemptsPerSuccess: 0,
+      averageTokensPerSuccess: 0,
       totalTokensUsed: 0,
     };
   }
 
-  const successfulRuns = runs.filter((r) => r.success).length;
-  const firstAttemptSuccesses = runs.filter(
-    (r) => r.attempts[0]?.success
-  ).length;
-  
-  // Cumulative success after each retry
-  let afterRetry1 = firstAttemptSuccesses;
-  let afterRetry2 = firstAttemptSuccesses;
-  let afterRetry3 = firstAttemptSuccesses;
+  const successfulRuns = runs.filter((r) => r.success);
+  const successfulRunsCount = successfulRuns.length;
+
+  // For sequential scenarios, check if all steps succeeded on first attempt
+  // For one-shot, check if first attempt succeeded
+  let firstAttemptSuccesses = 0;
+  let afterRetry1 = 0;
+  let afterRetry2 = 0;
+  let afterRetry3 = 0;
 
   for (const run of runs) {
-    if (run.attempts[0]?.success) continue; // Already counted
-    if (run.attempts[1]?.success) {
-      afterRetry1++;
-      afterRetry2++;
-      afterRetry3++;
-    } else if (run.attempts[2]?.success) {
-      afterRetry2++;
-      afterRetry3++;
-    } else if (run.attempts[3]?.success) {
-      afterRetry3++;
+    if (isSequential && run.steps) {
+      // Sequential: check max retries needed by any single step
+      const allStepsFirstAttempt = run.steps.every(s => s.attempts[0]?.success);
+      const maxRetriesPerStep = Math.max(...run.steps.map(s => s.attempts.length - 1));
+
+      if (allStepsFirstAttempt) {
+        firstAttemptSuccesses++;
+        afterRetry1++;
+        afterRetry2++;
+        afterRetry3++;
+      } else if (run.success) {
+        // Succeeded but needed retries - count based on max retries any step needed
+        if (maxRetriesPerStep <= 1) afterRetry1++;
+        if (maxRetriesPerStep <= 2) afterRetry2++;
+        if (maxRetriesPerStep <= 3) afterRetry3++;
+      }
+    } else {
+      // One-shot: simple attempt counting
+      if (run.attempts[0]?.success) {
+        firstAttemptSuccesses++;
+        afterRetry1++;
+        afterRetry2++;
+        afterRetry3++;
+      } else if (run.attempts[1]?.success) {
+        afterRetry1++;
+        afterRetry2++;
+        afterRetry3++;
+      } else if (run.attempts[2]?.success) {
+        afterRetry2++;
+        afterRetry3++;
+      } else if (run.attempts[3]?.success) {
+        afterRetry3++;
+      }
     }
   }
 
   const totalDuration = runs.reduce((sum, r) => sum + r.totalDurationMs, 0);
-  const totalAttempts = runs.reduce((sum, r) => sum + r.attempts.length, 0);
-  const totalTokens = runs.reduce((sum, r) => {
-    return sum + r.attempts.reduce((aSum, a) => {
-      return aSum + (a.inputTokens || 0) + (a.outputTokens || 0);
-    }, 0);
+
+  // Count total attempts (for sequential, sum across all steps)
+  const totalAttempts = runs.reduce((sum, r) => {
+    if (r.steps) {
+      return sum + r.steps.reduce((stepSum, s) => stepSum + s.attempts.length, 0);
+    }
+    return sum + r.attempts.length;
   }, 0);
 
+  // Calculate tokens
+  const getRunTokens = (r: RunResult) => {
+    if (r.steps) {
+      return r.steps.reduce((stepSum, s) =>
+        stepSum + s.attempts.reduce((aSum, a) =>
+          aSum + (a.inputTokens || 0) + (a.outputTokens || 0), 0), 0);
+    }
+    return r.attempts.reduce((aSum, a) =>
+      aSum + (a.inputTokens || 0) + (a.outputTokens || 0), 0);
+  };
+
+  const totalTokens = runs.reduce((sum, r) => sum + getRunTokens(r), 0);
+
+  // Calculate averages for successful runs only
+  const successfulAttempts = successfulRuns.reduce((sum, r) => {
+    if (r.steps) {
+      return sum + r.steps.reduce((stepSum, s) => stepSum + s.attempts.length, 0);
+    }
+    return sum + r.attempts.length;
+  }, 0);
+
+  const successfulTokens = successfulRuns.reduce((sum, r) => sum + getRunTokens(r), 0);
+
   return {
-    successRate: (successfulRuns / totalRuns) * 100,
+    successRate: (successfulRunsCount / totalRuns) * 100,
     firstAttemptSuccessRate: (firstAttemptSuccesses / totalRuns) * 100,
     afterRetry1SuccessRate: (afterRetry1 / totalRuns) * 100,
     afterRetry2SuccessRate: (afterRetry2 / totalRuns) * 100,
     afterRetry3SuccessRate: (afterRetry3 / totalRuns) * 100,
     averageDurationMs: totalDuration / totalRuns,
     averageAttempts: totalAttempts / totalRuns,
+    averageAttemptsPerSuccess: successfulRunsCount > 0 ? successfulAttempts / successfulRunsCount : 0,
+    averageTokensPerSuccess: successfulRunsCount > 0 ? successfulTokens / successfulRunsCount : 0,
     totalTokensUsed: totalTokens,
   };
 }

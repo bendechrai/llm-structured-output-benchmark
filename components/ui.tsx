@@ -1,7 +1,7 @@
 import { providers } from '@/lib/models';
 
 interface ProviderBadgeProps {
-  provider: 'openai' | 'anthropic' | 'google';
+  provider: 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter';
   size?: 'sm' | 'md';
 }
 
@@ -24,7 +24,7 @@ export function ProviderBadge({ provider, size = 'md' }: ProviderBadgeProps) {
 
 interface ModelBadgeProps {
   modelName: string;
-  provider: 'openai' | 'anthropic' | 'google';
+  provider: 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter';
 }
 
 export function ModelBadge({ modelName, provider }: ModelBadgeProps) {

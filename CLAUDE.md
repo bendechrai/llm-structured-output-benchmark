@@ -79,3 +79,26 @@ API keys must be configured for each provider:
 ## Testing Structure
 
 Tests run asynchronously in the background via API routes. Progress is tracked in memory and results are persisted to JSON files. The dashboard shows real-time progress and historical results with provider-specific UI elements and success rate calculations.
+
+## Unit Test Coverage
+
+Run tests with `npm test` or `npm test -- --coverage` for coverage report.
+
+### What We Test
+
+- **schemas.ts** (100%) - Zod schema validation is critical for correctness
+- **prompts.ts** (100%) - Prompt generation must be deterministic and correct
+- **models.ts** (100%) - Model configuration validation
+- **conversation.ts** (100%) - Conversation formatting for LLM context
+- **storage.ts** (80%) - File I/O operations with mocked `fs` module
+- **pricing** - Cost calculation functions and pricing data sanity checks
+
+### What We Don't Test (and Why)
+
+- **test-runner.ts** (0%) - This module's primary job is orchestrating AI SDK calls (`generateObject`, `generateText`). Testing it would require mocking the AI SDK responses, which would only test our mocking code, not actual LLM behaviour. The real validation happens via the benchmark runs themselves.
+
+- **active-runs.ts** (0%) - Contains only a Map instantiation and globalThis assignment for hot-reload persistence. No logic to test.
+
+- **React components** - Would require React Testing Library setup. The components are primarily presentational and the business logic they consume is tested via the lib modules.
+
+- **API routes** - Integration test territory. The routes primarily wire together tested lib functions.

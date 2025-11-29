@@ -39,7 +39,7 @@ This tool tests **6 different models** across **4 scenarios** with **10 runs eac
 1. Clone the repository:
 ```bash
 git clone <repository-url>
-cd llm-structured-response-test
+cd llm-structured-response-benchmark
 ```
 
 2. Install dependencies:

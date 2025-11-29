@@ -1,14 +1,17 @@
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { google } from '@ai-sdk/google';
+import { createGroq } from '@ai-sdk/groq';
 import { openai } from '@ai-sdk/openai';
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 import type { LanguageModel } from 'ai';
 
 export interface ModelConfig {
   id: string;
   name: string;
-  provider: 'openai' | 'anthropic' | 'google';
+  provider: 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter';
   model: LanguageModel;
   supportsStrictMode: boolean;
+  isReasoningModel?: boolean;
 }
 
 // Create Anthropic client with structured outputs beta header
@@ -26,6 +29,7 @@ const openaiModels: ModelConfig[] = [
     provider: 'openai',
     model: openai('gpt-5'),
     supportsStrictMode: true,
+    isReasoningModel: true,
   },
   {
     id: 'openai-gpt4o',
@@ -72,11 +76,53 @@ const googleModels: ModelConfig[] = [
   },
 ];
 
+const groq = createGroq();
+
+const groqModels: ModelConfig[] = [
+  {
+    id: 'groq-gpt-oss-120b',
+    name: 'GPT-OSS 120B',
+    provider: 'groq',
+    model: groq('openai/gpt-oss-120b'),
+    supportsStrictMode: false,
+  },
+  {
+    id: 'groq-kimi-k2',
+    name: 'Kimi K2',
+    provider: 'groq',
+    model: groq('moonshotai/kimi-k2-instruct-0905'),
+    supportsStrictMode: false,
+  },
+  {
+    id: 'groq-llama-3.3-70b',
+    name: 'Llama 3.3 70B',
+    provider: 'groq',
+    model: groq('llama-3.3-70b-versatile'),
+    supportsStrictMode: false,
+  },
+];
+
+const openrouter = createOpenRouter({
+  apiKey: process.env.OPENROUTER_API_KEY,
+});
+
+const openrouterModels: ModelConfig[] = [
+  {
+    id: 'openrouter-qwen3-235b',
+    name: 'Qwen3 235B',
+    provider: 'openrouter',
+    model: openrouter.chat('qwen/qwen3-235b-a22b'),
+    supportsStrictMode: false,
+  },
+];
+
 // All models
 export const models: ModelConfig[] = [
   ...openaiModels,
   ...anthropicModels,
   ...googleModels,
+  ...groqModels,
+  ...openrouterModels,
 ];
 
 export type ModelId = typeof models[number]['id'];
@@ -85,7 +131,7 @@ export function getModel(id: string): ModelConfig | undefined {
   return models.find(m => m.id === id);
 }
 
-export function getModelsByProvider(provider: 'openai' | 'anthropic' | 'google'): ModelConfig[] {
+export function getModelsByProvider(provider: 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter'): ModelConfig[] {
   return models.filter(m => m.provider === provider);
 }
 
@@ -108,5 +154,13 @@ export const providers = {
   google: {
     name: 'Google',
     color: '#4285f4',
+  },
+  groq: {
+    name: 'Groq',
+    color: '#f55036',
+  },
+  openrouter: {
+    name: 'OpenRouter',
+    color: '#6366f1',
   },
 } as const;

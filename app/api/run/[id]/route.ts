@@ -8,7 +8,6 @@ export async function GET(
 ) {
   const { id } = await params;
 
-  // Check active runs first
   const activeRun = activeRuns.get(id);
   if (activeRun) {
     return NextResponse.json({
@@ -17,6 +16,8 @@ export async function GET(
       progress: activeRun.progress,
       error: activeRun.error,
       summary: activeRun.run.summary,
+      results: activeRun.run.results,
+      config: activeRun.run.config,
     });
   }
 

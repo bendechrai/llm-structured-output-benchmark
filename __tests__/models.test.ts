@@ -9,7 +9,7 @@ import {
 describe('Model Configuration', () => {
   describe('models array', () => {
     it('should contain expected number of models', () => {
-      expect(models).toHaveLength(6);
+      expect(models).toHaveLength(10);
     });
 
     it('should have models from all providers', () => {
@@ -21,12 +21,16 @@ describe('Model Configuration', () => {
       expect(providerCounts.openai).toBe(2);
       expect(providerCounts.anthropic).toBe(2);
       expect(providerCounts.google).toBe(2);
+      expect(providerCounts.groq).toBe(3);
+      expect(providerCounts.openrouter).toBe(1);
     });
 
-    it('should have all models supporting strict mode', () => {
-      models.forEach((model) => {
-        expect(model.supportsStrictMode).toBe(true);
-      });
+    it('should have correct strict mode support', () => {
+      const strictModeModels = models.filter(m => m.supportsStrictMode);
+      const nonStrictModeModels = models.filter(m => !m.supportsStrictMode);
+
+      expect(strictModeModels.length).toBeGreaterThan(0);
+      expect(nonStrictModeModels.every(m => m.provider === 'groq' || m.provider === 'openrouter')).toBe(true);
     });
 
     it('should have unique model IDs', () => {
@@ -45,7 +49,7 @@ describe('Model Configuration', () => {
 
         expect(typeof model.id).toBe('string');
         expect(typeof model.name).toBe('string');
-        expect(['openai', 'anthropic', 'google']).toContain(model.provider);
+        expect(['openai', 'anthropic', 'google', 'groq', 'openrouter']).toContain(model.provider);
         expect(typeof model.supportsStrictMode).toBe('boolean');
       });
     });
@@ -114,6 +118,14 @@ describe('Model Configuration', () => {
         name: 'Google',
         color: '#4285f4',
       });
+      expect(providers.groq).toEqual({
+        name: 'Groq',
+        color: '#f55036',
+      });
+      expect(providers.openrouter).toEqual({
+        name: 'OpenRouter',
+        color: '#6366f1',
+      });
     });
   });
 
@@ -140,6 +152,34 @@ describe('Model Configuration', () => {
 
       expect(flash?.name).toBe('Gemini 2.5 Flash');
       expect(pro?.name).toBe('Gemini 3 Pro');
+    });
+
+    it('should include expected Groq models', () => {
+      const gptOss = getModel('groq-gpt-oss-120b');
+      const kimiK2 = getModel('groq-kimi-k2');
+      const llama = getModel('groq-llama-3.3-70b');
+
+      expect(gptOss?.name).toBe('GPT-OSS 120B');
+      expect(kimiK2?.name).toBe('Kimi K2');
+      expect(llama?.name).toBe('Llama 3.3 70B');
+    });
+  });
+
+  describe('getModelsByProvider for Groq', () => {
+    it('should return models for Groq', () => {
+      const groqModels = getModelsByProvider('groq');
+      expect(groqModels).toHaveLength(3);
+      groqModels.forEach((model) => {
+        expect(model.provider).toBe('groq');
+      });
+    });
+  });
+
+  describe('getModelsByProvider for OpenRouter', () => {
+    it('should return models for OpenRouter', () => {
+      const openrouterModels = getModelsByProvider('openrouter');
+      expect(openrouterModels).toHaveLength(1);
+      expect(openrouterModels[0].id).toBe('openrouter-qwen3-235b');
     });
   });
 });

@@ -50,13 +50,14 @@ Important:
  */
 export const oneShotStrictPrompt = `Based on the conversation above, recommend a team member who could help solve their problem.
 
-Your recommendation should include:
-- A clear explanation of why you're recommending this role
-- The job title
-- Why this role addresses their specific problem
-- 3-7 required skills
-- A system prompt for an AI in this role
-- Whether "reasoning" or "semantic" model type is best suited`;
+Respond with a JSON object containing:
+- "recommendation": Your explanation of why you're recommending this role
+- "action": An object with "type": "create_actor" and "actor" containing:
+  - "title": The job title
+  - "reason": Why this role addresses the team's problem
+  - "skills": Array of 3-7 required skills
+  - "prompt": A system prompt for an AI in this role
+  - "model": Either "reasoning" or "semantic"`;
 
 /**
  * Sequential prompts for multi-step generation
@@ -75,7 +76,11 @@ Important:
 
     strict: `Based on the conversation, what type of team member should this team add?
 
-Provide a recommendation explaining who they should hire and why. Set action to "create_actor" to recommend a new team member.`,
+Respond with a JSON object containing:
+- "recommendation": A string explaining who should be hired and why
+- "action": Either "create_actor" to recommend someone, or null
+
+Example: {"recommendation": "I recommend hiring...", "action": "create_actor"}`,
   },
 
   step2: {
@@ -91,10 +96,12 @@ Important:
 
     strict: `For the role you recommended, provide their details.
 
-Include:
-- The specific job title
-- Why this role addresses the team's skill gap
-- 3-7 specific technical skills they would need`,
+Respond with a JSON object containing:
+- "title": The job title (e.g., "Database Administrator")
+- "reason": Why this role addresses the team's skill gap
+- "skills": An array of 3-7 specific technical skills
+
+Example: {"title": "Senior DBA", "reason": "The team needs...", "skills": ["PostgreSQL", "Query Optimization"]}`,
   },
 
   step3: {
@@ -110,9 +117,11 @@ Important:
 
     strict: `For this role, provide the AI configuration.
 
-Include:
-- A system prompt that would configure an AI assistant for this role
-- Whether "reasoning" (for analytical/logical tasks) or "semantic" (for creative/conversational tasks) model type is more appropriate`,
+Respond with a JSON object containing:
+- "prompt": A system prompt for configuring an AI assistant in this role
+- "model": Either "reasoning" (for analytical/logical tasks) or "semantic" (for creative/conversational tasks)
+
+Example: {"prompt": "You are an expert database administrator...", "model": "reasoning"}`,
   },
 };
 

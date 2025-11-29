@@ -1,7 +1,7 @@
 import { generateObject, generateText } from 'ai';
 import type { ZodSchema } from 'zod';
 import { ZodError } from 'zod';
-import { getModel, type ModelConfig } from './models';
+import { getModelWithKeys, type ModelConfig, type ApiKeys } from './models-factory';
 import {
   ResponseSchema,
   SequentialPart1Schema,
@@ -23,6 +23,7 @@ import {
 } from './prompts';
 import {
   type AttemptResult,
+  type StepResult,
   type RunResult,
   type ScenarioResult,
   type TestRunFile,
@@ -32,9 +33,9 @@ import {
 
 export interface TestConfig {
   temperature: number;
-  maxTokens: number;
   maxRetries: number;
   runsPerScenario: number;
+  apiKeys?: ApiKeys;
 }
 
 export interface LogEntry {
@@ -43,6 +44,8 @@ export interface LogEntry {
   modelName: string;
   scenario: number;
   runNumber: number;
+  stepNumber?: number;
+  stepName?: string;
   attemptNumber: number;
   type: 'request' | 'response' | 'validation';
   prompt?: string;
@@ -58,6 +61,8 @@ export interface TestProgress {
   modelName: string;
   scenario: number;
   runNumber: number;
+  stepNumber?: number;
+  stepName?: string;
   attemptNumber: number;
   status: 'running' | 'success' | 'failed' | 'retrying';
   message?: string;
@@ -66,9 +71,18 @@ export interface TestProgress {
 
 export type ProgressCallback = (progress: TestProgress) => void;
 
+export interface RunCompleteEvent {
+  modelId: string;
+  scenario: number;
+  runNumber: number;
+  runResult: RunResult;
+  isSequential: boolean;
+}
+
+export type RunCompleteCallback = (event: RunCompleteEvent) => void;
+
 const DEFAULT_CONFIG: TestConfig = {
   temperature: 0.1,
-  maxTokens: 1500,
   maxRetries: 3,
   runsPerScenario: 10,
 };
@@ -84,6 +98,50 @@ function parseZodErrors(error: ZodError): ValidationError[] {
   }));
 }
 
+const RATE_LIMITED_PROVIDERS = ['groq', 'openrouter'];
+const RATE_LIMIT_DELAY_MS = 5000;
+const BACKOFF_BASE_MS = 5000;
+const BACKOFF_MAX_RETRIES = 4;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRateLimitError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    if (message.includes('429') || message.includes('rate limit') || message.includes('too many requests')) {
+      return true;
+    }
+  }
+  if (error && typeof error === 'object' && 'status' in error) {
+    return (error as { status: number }).status === 429;
+  }
+  return false;
+}
+
+async function withExponentialBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = BACKOFF_MAX_RETRIES
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (isRateLimitError(error) && attempt < maxRetries) {
+        const delayMs = BACKOFF_BASE_MS * Math.pow(2, attempt);
+        console.log(`Rate limited (429), backing off for ${delayMs / 1000}s before retry ${attempt + 1}/${maxRetries}...`);
+        await sleep(delayMs);
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw lastError;
+}
+
 /**
  * Run a single attempt with generateText (non-strict mode)
  */
@@ -93,12 +151,22 @@ async function runNonStrictAttempt<T>(
   schema: ZodSchema<T>,
   config: TestConfig
 ): Promise<{ success: boolean; data?: T; raw: string; errors?: ValidationError[]; tokens?: { input: number; output: number } }> {
-  const result = await generateText({
+  const result = await withExponentialBackoff(() => generateText({
     model: model.model,
     messages,
-    temperature: config.temperature,
-    maxOutputTokens: config.maxTokens,
-  });
+    ...(model.isReasoningModel ? {} : { temperature: config.temperature }),
+    ...(model.isReasoningModel ? {
+      providerOptions: {
+        openai: {
+          reasoningEffort: 'low',
+        },
+      },
+    } : {}),
+  }));
+
+  if (RATE_LIMITED_PROVIDERS.includes(model.provider)) {
+    await sleep(RATE_LIMIT_DELAY_MS);
+  }
 
   const raw = result.text;
   const cleaned = extractJson(raw);
@@ -152,13 +220,23 @@ async function runStrictAttempt<T>(
   config: TestConfig
 ): Promise<{ success: boolean; data?: T; raw: string; errors?: ValidationError[]; tokens?: { input: number; output: number } }> {
   try {
-    const result = await generateObject({
+    const result = await withExponentialBackoff(() => generateObject({
       model: model.model,
       messages,
       schema,
-      temperature: config.temperature,
-      maxOutputTokens: config.maxTokens,
-    });
+      ...(model.isReasoningModel ? {} : { temperature: config.temperature }),
+        ...(model.isReasoningModel ? {
+        providerOptions: {
+          openai: {
+            reasoningEffort: 'low',
+          },
+        },
+      } : {}),
+    }));
+
+    if (RATE_LIMITED_PROVIDERS.includes(model.provider)) {
+      await sleep(RATE_LIMIT_DELAY_MS);
+    }
 
     return {
       success: true,
@@ -169,11 +247,16 @@ async function runStrictAttempt<T>(
         output: result.usage?.outputTokens || 0,
       },
     };
-  } catch (error) {
+  } catch (error: unknown) {
+    let rawText = '';
+    if (error && typeof error === 'object' && 'text' in error) {
+      rawText = (error as { text: string }).text || '';
+    }
+
     if (error instanceof ZodError) {
       return {
         success: false,
-        raw: '',
+        raw: rawText,
         errors: parseZodErrors(error),
       };
     }
@@ -181,7 +264,7 @@ async function runStrictAttempt<T>(
     const errorMessage = error instanceof Error ? error.message : String(error);
     return {
       success: false,
-      raw: '',
+      raw: rawText || `Error: ${errorMessage}`,
       errors: [{ path: [], message: errorMessage, code: 'api_error' }],
     };
   }
@@ -193,7 +276,8 @@ async function runStrictAttempt<T>(
 async function runScenario1(
   model: ModelConfig,
   config: TestConfig,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  onRunComplete?: RunCompleteCallback
 ): Promise<RunResult[]> {
   const runs: RunResult[] = [];
   const conversationText = formatConversation();
@@ -296,12 +380,21 @@ async function runScenario1(
       }
     }
 
-    runs.push({
+    const runResult: RunResult = {
       runNumber: runNum,
       success,
       attempts,
       totalDurationMs: Date.now() - runStartTime,
       finalResponse,
+    };
+    runs.push(runResult);
+
+    onRunComplete?.({
+      modelId: model.id,
+      scenario: 1,
+      runNumber: runNum,
+      runResult,
+      isSequential: false,
     });
   }
 
@@ -314,7 +407,8 @@ async function runScenario1(
 async function runScenario2(
   model: ModelConfig,
   config: TestConfig,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  onRunComplete?: RunCompleteCallback
 ): Promise<RunResult[]> {
   const runs: RunResult[] = [];
   const conversationText = formatConversation();
@@ -333,6 +427,19 @@ async function runScenario2(
         { role: 'user', content: `Here is a conversation between team members:\n\n${conversationText}` },
         { role: 'user', content: oneShotStrictPrompt },
       ];
+
+      // Add retry context if not first attempt
+      if (attempt > 1 && attempts.length > 0) {
+        const lastAttempt = attempts[attempts.length - 1];
+        messages.push({
+          role: 'assistant',
+          content: lastAttempt.rawResponse,
+        });
+        messages.push({
+          role: 'user',
+          content: getRetryPrompt(lastAttempt.rawResponse, lastAttempt.validationErrors),
+        });
+      }
 
       const promptText = messages.map(m => `[${m.role}] ${m.content}`).join('\n\n');
       onProgress?.({
@@ -404,12 +511,21 @@ async function runScenario2(
       }
     }
 
-    runs.push({
+    const runResult: RunResult = {
       runNumber: runNum,
       success,
       attempts,
       totalDurationMs: Date.now() - runStartTime,
       finalResponse,
+    };
+    runs.push(runResult);
+
+    onRunComplete?.({
+      modelId: model.id,
+      scenario: 2,
+      runNumber: runNum,
+      runResult,
+      isSequential: false,
     });
   }
 
@@ -422,28 +538,21 @@ async function runScenario2(
 async function runScenario3(
   model: ModelConfig,
   config: TestConfig,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  onRunComplete?: RunCompleteCallback
 ): Promise<RunResult[]> {
   const runs: RunResult[] = [];
   const conversationText = formatConversation();
 
   for (let runNum = 1; runNum <= config.runsPerScenario; runNum++) {
-    const attempts: AttemptResult[] = [];
+    const steps: StepResult[] = [];
     let success = false;
     let finalResponse: Record<string, unknown> | null = null;
     const runStartTime = Date.now();
 
-    onProgress?.({
-      modelId: model.id,
-      modelName: model.name,
-      scenario: 3,
-      runNumber: runNum,
-      attemptNumber: 1,
-      status: 'running',
-    });
-
     try {
-      // Step 1
+      // Step 1: Initial recommendation
+      const step1: StepResult = { stepNumber: 1, stepName: 'Recommendation', success: false, attempts: [] };
       let step1Result: SequentialPart1 | null = null;
       let step1Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
         { role: 'system', content: systemPrompt },
@@ -454,9 +563,33 @@ async function runScenario3(
       for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
         const attemptStartTime = Date.now();
         const promptText = step1Messages.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 3,
+          runNumber: runNum,
+          stepNumber: 1,
+          stepName: 'Recommendation',
+          attemptNumber: attempt,
+          status: attempt === 1 ? 'running' : 'retrying',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 3,
+            runNumber: runNum,
+            stepNumber: 1,
+            stepName: 'Recommendation',
+            attemptNumber: attempt,
+            type: 'request',
+            prompt: promptText,
+          },
+        });
+
         const result = await runNonStrictAttempt(model, step1Messages, SequentialPart1Schema, config);
 
-        attempts.push({
+        const attemptResult: AttemptResult = {
           attemptNumber: attempt,
           timestamp: new Date().toISOString(),
           success: result.success,
@@ -468,14 +601,39 @@ async function runScenario3(
           parsedResponse: result.success ? (result.data as Record<string, unknown>) : null,
           validationErrors: result.errors || [],
           errorMessage: null,
+        };
+        step1.attempts.push(attemptResult);
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 3,
+          runNumber: runNum,
+          stepNumber: 1,
+          stepName: 'Recommendation',
+          attemptNumber: attempt,
+          status: result.success ? 'success' : 'failed',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 3,
+            runNumber: runNum,
+            stepNumber: 1,
+            stepName: 'Recommendation',
+            attemptNumber: attempt,
+            type: 'response',
+            response: result.raw,
+            validationResult: { success: result.success, errors: result.errors },
+          },
         });
 
         if (result.success) {
           step1Result = result.data as SequentialPart1;
+          step1.success = true;
           break;
         }
 
-        // Add retry context
         step1Messages = [
           ...step1Messages,
           { role: 'assistant' as const, content: result.raw },
@@ -483,9 +641,11 @@ async function runScenario3(
         ];
       }
 
+      steps.push(step1);
       if (!step1Result) throw new Error('Step 1 failed');
 
-      // Step 2
+      // Step 2: Actor details
+      const step2: StepResult = { stepNumber: 2, stepName: 'Details', success: false, attempts: [] };
       let step2Result: SequentialPart2 | null = null;
       let step2Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
         { role: 'system', content: systemPrompt },
@@ -497,9 +657,33 @@ async function runScenario3(
       for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
         const attemptStartTime = Date.now();
         const promptText = step2Messages.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 3,
+          runNumber: runNum,
+          stepNumber: 2,
+          stepName: 'Details',
+          attemptNumber: attempt,
+          status: attempt === 1 ? 'running' : 'retrying',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 3,
+            runNumber: runNum,
+            stepNumber: 2,
+            stepName: 'Details',
+            attemptNumber: attempt,
+            type: 'request',
+            prompt: promptText,
+          },
+        });
+
         const result = await runNonStrictAttempt(model, step2Messages, SequentialPart2Schema, config);
 
-        attempts.push({
+        const attemptResult: AttemptResult = {
           attemptNumber: attempt,
           timestamp: new Date().toISOString(),
           success: result.success,
@@ -511,10 +695,36 @@ async function runScenario3(
           parsedResponse: result.success ? (result.data as Record<string, unknown>) : null,
           validationErrors: result.errors || [],
           errorMessage: null,
+        };
+        step2.attempts.push(attemptResult);
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 3,
+          runNumber: runNum,
+          stepNumber: 2,
+          stepName: 'Details',
+          attemptNumber: attempt,
+          status: result.success ? 'success' : 'failed',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 3,
+            runNumber: runNum,
+            stepNumber: 2,
+            stepName: 'Details',
+            attemptNumber: attempt,
+            type: 'response',
+            response: result.raw,
+            validationResult: { success: result.success, errors: result.errors },
+          },
         });
 
         if (result.success) {
           step2Result = result.data as SequentialPart2;
+          step2.success = true;
           break;
         }
 
@@ -525,9 +735,11 @@ async function runScenario3(
         ];
       }
 
+      steps.push(step2);
       if (!step2Result) throw new Error('Step 2 failed');
 
-      // Step 3
+      // Step 3: AI config
+      const step3: StepResult = { stepNumber: 3, stepName: 'AI Config', success: false, attempts: [] };
       let step3Result: SequentialPart3 | null = null;
       let step3Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
         { role: 'system', content: systemPrompt },
@@ -540,9 +752,33 @@ async function runScenario3(
       for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
         const attemptStartTime = Date.now();
         const promptText = step3Messages.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 3,
+          runNumber: runNum,
+          stepNumber: 3,
+          stepName: 'AI Config',
+          attemptNumber: attempt,
+          status: attempt === 1 ? 'running' : 'retrying',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 3,
+            runNumber: runNum,
+            stepNumber: 3,
+            stepName: 'AI Config',
+            attemptNumber: attempt,
+            type: 'request',
+            prompt: promptText,
+          },
+        });
+
         const result = await runNonStrictAttempt(model, step3Messages, SequentialPart3Schema, config);
 
-        attempts.push({
+        const attemptResult: AttemptResult = {
           attemptNumber: attempt,
           timestamp: new Date().toISOString(),
           success: result.success,
@@ -554,10 +790,36 @@ async function runScenario3(
           parsedResponse: result.success ? (result.data as Record<string, unknown>) : null,
           validationErrors: result.errors || [],
           errorMessage: null,
+        };
+        step3.attempts.push(attemptResult);
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 3,
+          runNumber: runNum,
+          stepNumber: 3,
+          stepName: 'AI Config',
+          attemptNumber: attempt,
+          status: result.success ? 'success' : 'failed',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 3,
+            runNumber: runNum,
+            stepNumber: 3,
+            stepName: 'AI Config',
+            attemptNumber: attempt,
+            type: 'response',
+            response: result.raw,
+            validationResult: { success: result.success, errors: result.errors },
+          },
         });
 
         if (result.success) {
           step3Result = result.data as SequentialPart3;
+          step3.success = true;
           break;
         }
 
@@ -568,41 +830,35 @@ async function runScenario3(
         ];
       }
 
+      steps.push(step3);
       if (!step3Result) throw new Error('Step 3 failed');
 
       // Merge and validate final result
       const merged = mergeSequentialParts(step1Result, step2Result, step3Result);
       ResponseSchema.parse(merged);
-      
+
       success = true;
       finalResponse = merged as unknown as Record<string, unknown>;
-
-      onProgress?.({
-        modelId: model.id,
-        modelName: model.name,
-        scenario: 3,
-        runNumber: runNum,
-        attemptNumber: attempts.length,
-        status: 'success',
-      });
-    } catch (error) {
-      onProgress?.({
-        modelId: model.id,
-        modelName: model.name,
-        scenario: 3,
-        runNumber: runNum,
-        attemptNumber: attempts.length,
-        status: 'failed',
-        message: error instanceof Error ? error.message : String(error),
-      });
+    } catch {
+      // Mark any incomplete steps
     }
 
-    runs.push({
+    const runResult: RunResult = {
       runNumber: runNum,
       success,
-      attempts,
+      attempts: [],
+      steps,
       totalDurationMs: Date.now() - runStartTime,
       finalResponse,
+    };
+    runs.push(runResult);
+
+    onRunComplete?.({
+      modelId: model.id,
+      scenario: 3,
+      runNumber: runNum,
+      runResult,
+      isSequential: true,
     });
   }
 
@@ -615,30 +871,23 @@ async function runScenario3(
 async function runScenario4(
   model: ModelConfig,
   config: TestConfig,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  onRunComplete?: RunCompleteCallback
 ): Promise<RunResult[]> {
   const runs: RunResult[] = [];
   const conversationText = formatConversation();
 
   for (let runNum = 1; runNum <= config.runsPerScenario; runNum++) {
-    const attempts: AttemptResult[] = [];
+    const steps: StepResult[] = [];
     let success = false;
     let finalResponse: Record<string, unknown> | null = null;
     const runStartTime = Date.now();
 
-    onProgress?.({
-      modelId: model.id,
-      modelName: model.name,
-      scenario: 4,
-      runNumber: runNum,
-      attemptNumber: 1,
-      status: 'running',
-    });
-
     try {
-      // Step 1
+      // Step 1: Initial recommendation
+      const step1: StepResult = { stepNumber: 1, stepName: 'Recommendation', success: false, attempts: [] };
       let step1Result: SequentialPart1 | null = null;
-      const step1Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      let step1Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: `Here is a conversation between team members:\n\n${conversationText}` },
         { role: 'user', content: sequentialPrompts.step1.strict },
@@ -647,9 +896,33 @@ async function runScenario4(
       for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
         const attemptStartTime = Date.now();
         const promptText = step1Messages.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 4,
+          runNumber: runNum,
+          stepNumber: 1,
+          stepName: 'Recommendation',
+          attemptNumber: attempt,
+          status: attempt === 1 ? 'running' : 'retrying',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 4,
+            runNumber: runNum,
+            stepNumber: 1,
+            stepName: 'Recommendation',
+            attemptNumber: attempt,
+            type: 'request',
+            prompt: promptText,
+          },
+        });
+
         const result = await runStrictAttempt(model, step1Messages, SequentialPart1Schema, config);
 
-        attempts.push({
+        const attemptResult: AttemptResult = {
           attemptNumber: attempt,
           timestamp: new Date().toISOString(),
           success: result.success,
@@ -661,19 +934,53 @@ async function runScenario4(
           parsedResponse: result.success ? (result.data as Record<string, unknown>) : null,
           validationErrors: result.errors || [],
           errorMessage: null,
+        };
+        step1.attempts.push(attemptResult);
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 4,
+          runNumber: runNum,
+          stepNumber: 1,
+          stepName: 'Recommendation',
+          attemptNumber: attempt,
+          status: result.success ? 'success' : 'failed',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 4,
+            runNumber: runNum,
+            stepNumber: 1,
+            stepName: 'Recommendation',
+            attemptNumber: attempt,
+            type: 'response',
+            response: result.raw,
+            validationResult: { success: result.success, errors: result.errors },
+          },
         });
 
         if (result.success) {
           step1Result = result.data as SequentialPart1;
+          step1.success = true;
           break;
         }
+
+        step1Messages = [
+          ...step1Messages,
+          { role: 'assistant' as const, content: result.raw },
+          { role: 'user' as const, content: getRetryPrompt(result.raw, result.errors || []) },
+        ];
       }
 
+      steps.push(step1);
       if (!step1Result) throw new Error('Step 1 failed');
 
-      // Step 2
+      // Step 2: Actor details
+      const step2: StepResult = { stepNumber: 2, stepName: 'Details', success: false, attempts: [] };
       let step2Result: SequentialPart2 | null = null;
-      const step2Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      let step2Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: `Here is a conversation between team members:\n\n${conversationText}` },
         { role: 'assistant', content: JSON.stringify(step1Result) },
@@ -683,9 +990,33 @@ async function runScenario4(
       for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
         const attemptStartTime = Date.now();
         const promptText = step2Messages.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 4,
+          runNumber: runNum,
+          stepNumber: 2,
+          stepName: 'Details',
+          attemptNumber: attempt,
+          status: attempt === 1 ? 'running' : 'retrying',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 4,
+            runNumber: runNum,
+            stepNumber: 2,
+            stepName: 'Details',
+            attemptNumber: attempt,
+            type: 'request',
+            prompt: promptText,
+          },
+        });
+
         const result = await runStrictAttempt(model, step2Messages, SequentialPart2Schema, config);
 
-        attempts.push({
+        const attemptResult: AttemptResult = {
           attemptNumber: attempt,
           timestamp: new Date().toISOString(),
           success: result.success,
@@ -697,19 +1028,53 @@ async function runScenario4(
           parsedResponse: result.success ? (result.data as Record<string, unknown>) : null,
           validationErrors: result.errors || [],
           errorMessage: null,
+        };
+        step2.attempts.push(attemptResult);
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 4,
+          runNumber: runNum,
+          stepNumber: 2,
+          stepName: 'Details',
+          attemptNumber: attempt,
+          status: result.success ? 'success' : 'failed',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 4,
+            runNumber: runNum,
+            stepNumber: 2,
+            stepName: 'Details',
+            attemptNumber: attempt,
+            type: 'response',
+            response: result.raw,
+            validationResult: { success: result.success, errors: result.errors },
+          },
         });
 
         if (result.success) {
           step2Result = result.data as SequentialPart2;
+          step2.success = true;
           break;
         }
+
+        step2Messages = [
+          ...step2Messages,
+          { role: 'assistant' as const, content: result.raw },
+          { role: 'user' as const, content: getRetryPrompt(result.raw, result.errors || []) },
+        ];
       }
 
+      steps.push(step2);
       if (!step2Result) throw new Error('Step 2 failed');
 
-      // Step 3
+      // Step 3: AI config
+      const step3: StepResult = { stepNumber: 3, stepName: 'AI Config', success: false, attempts: [] };
       let step3Result: SequentialPart3 | null = null;
-      const step3Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      let step3Messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: `Here is a conversation between team members:\n\n${conversationText}` },
         { role: 'assistant', content: JSON.stringify(step1Result) },
@@ -720,9 +1085,33 @@ async function runScenario4(
       for (let attempt = 1; attempt <= config.maxRetries + 1; attempt++) {
         const attemptStartTime = Date.now();
         const promptText = step3Messages.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 4,
+          runNumber: runNum,
+          stepNumber: 3,
+          stepName: 'AI Config',
+          attemptNumber: attempt,
+          status: attempt === 1 ? 'running' : 'retrying',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 4,
+            runNumber: runNum,
+            stepNumber: 3,
+            stepName: 'AI Config',
+            attemptNumber: attempt,
+            type: 'request',
+            prompt: promptText,
+          },
+        });
+
         const result = await runStrictAttempt(model, step3Messages, SequentialPart3Schema, config);
 
-        attempts.push({
+        const attemptResult: AttemptResult = {
           attemptNumber: attempt,
           timestamp: new Date().toISOString(),
           success: result.success,
@@ -734,49 +1123,75 @@ async function runScenario4(
           parsedResponse: result.success ? (result.data as Record<string, unknown>) : null,
           validationErrors: result.errors || [],
           errorMessage: null,
+        };
+        step3.attempts.push(attemptResult);
+
+        onProgress?.({
+          modelId: model.id,
+          modelName: model.name,
+          scenario: 4,
+          runNumber: runNum,
+          stepNumber: 3,
+          stepName: 'AI Config',
+          attemptNumber: attempt,
+          status: result.success ? 'success' : 'failed',
+          logEntry: {
+            timestamp: new Date().toISOString(),
+            modelId: model.id,
+            modelName: model.name,
+            scenario: 4,
+            runNumber: runNum,
+            stepNumber: 3,
+            stepName: 'AI Config',
+            attemptNumber: attempt,
+            type: 'response',
+            response: result.raw,
+            validationResult: { success: result.success, errors: result.errors },
+          },
         });
 
         if (result.success) {
           step3Result = result.data as SequentialPart3;
+          step3.success = true;
           break;
         }
+
+        step3Messages = [
+          ...step3Messages,
+          { role: 'assistant' as const, content: result.raw },
+          { role: 'user' as const, content: getRetryPrompt(result.raw, result.errors || []) },
+        ];
       }
 
+      steps.push(step3);
       if (!step3Result) throw new Error('Step 3 failed');
 
       // Merge and validate final result
       const merged = mergeSequentialParts(step1Result, step2Result, step3Result);
       ResponseSchema.parse(merged);
-      
+
       success = true;
       finalResponse = merged as unknown as Record<string, unknown>;
-
-      onProgress?.({
-        modelId: model.id,
-        modelName: model.name,
-        scenario: 4,
-        runNumber: runNum,
-        attemptNumber: attempts.length,
-        status: 'success',
-      });
-    } catch (error) {
-      onProgress?.({
-        modelId: model.id,
-        modelName: model.name,
-        scenario: 4,
-        runNumber: runNum,
-        attemptNumber: attempts.length,
-        status: 'failed',
-        message: error instanceof Error ? error.message : String(error),
-      });
+    } catch {
+      // Mark any incomplete steps
     }
 
-    runs.push({
+    const runResult: RunResult = {
       runNumber: runNum,
       success,
-      attempts,
+      attempts: [],
+      steps,
       totalDurationMs: Date.now() - runStartTime,
       finalResponse,
+    };
+    runs.push(runResult);
+
+    onRunComplete?.({
+      modelId: model.id,
+      scenario: 4,
+      runNumber: runNum,
+      runResult,
+      isSequential: true,
     });
   }
 
@@ -790,38 +1205,45 @@ export async function runModelTests(
   modelId: string,
   scenarios: number[],
   config: TestConfig = DEFAULT_CONFIG,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  onRunComplete?: RunCompleteCallback
 ): Promise<{ [scenario: string]: ScenarioResult }> {
-  const model = getModel(modelId);
+  const model = getModelWithKeys(modelId, config.apiKeys || {});
   if (!model) {
-    throw new Error(`Model not found: ${modelId}`);
+    throw new Error(`Model not found or missing API key: ${modelId}`);
   }
 
   const results: { [scenario: string]: ScenarioResult } = {};
 
   for (const scenario of scenarios) {
+    const isStrictScenario = scenario === 2 || scenario === 4;
+    if (isStrictScenario && !model.supportsStrictMode) {
+      continue;
+    }
+
     let runs: RunResult[];
 
     switch (scenario) {
       case 1:
-        runs = await runScenario1(model, config, onProgress);
+        runs = await runScenario1(model, config, onProgress, onRunComplete);
         break;
       case 2:
-        runs = await runScenario2(model, config, onProgress);
+        runs = await runScenario2(model, config, onProgress, onRunComplete);
         break;
       case 3:
-        runs = await runScenario3(model, config, onProgress);
+        runs = await runScenario3(model, config, onProgress, onRunComplete);
         break;
       case 4:
-        runs = await runScenario4(model, config, onProgress);
+        runs = await runScenario4(model, config, onProgress, onRunComplete);
         break;
       default:
         throw new Error(`Invalid scenario: ${scenario}`);
     }
 
+    const isSequential = scenario === 3 || scenario === 4;
     results[scenario.toString()] = {
       runs,
-      summary: calculateScenarioSummary(runs),
+      summary: calculateScenarioSummary(runs, isSequential),
     };
   }
 
@@ -835,12 +1257,13 @@ export async function runFullTestSuite(
   modelIds: string[],
   scenarios: number[],
   config: TestConfig = DEFAULT_CONFIG,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  onRunComplete?: RunCompleteCallback
 ): Promise<TestRunFile['results']> {
   const results: TestRunFile['results'] = {};
 
   for (const modelId of modelIds) {
-    results[modelId] = await runModelTests(modelId, scenarios, config, onProgress);
+    results[modelId] = await runModelTests(modelId, scenarios, config, onProgress, onRunComplete);
   }
 
   return results;

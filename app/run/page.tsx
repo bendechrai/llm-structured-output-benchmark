@@ -1,9 +1,15 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { Card, Button, ProviderBadge, ScenarioBadge, SuccessRate } from '@/components/ui';
 import { ActivityLog } from '@/components/ActivityLog';
+import { SuccessRateChart } from '@/components/SuccessRateChart';
+import { CostTimeScatterChart } from '@/components/CostTimeScatterChart';
+import { modelPricing } from '@/lib/pricing';
+import { useApiKeys } from '@/lib/api-keys-context';
+import type { ScenarioResult, RunResult } from '@/lib/storage';
 
 interface Model {
   id: string;
@@ -14,10 +20,28 @@ interface Model {
 
 type AttemptStatus = 'pending' | 'running' | 'failed' | 'success' | 'skipped';
 
-interface RunAttempts {
-  run: number;
+interface StepProgress {
+  stepNumber: number;
+  stepName: string;
   attempts: AttemptStatus[];
-  final: 'pending' | 'success' | 'failed';
+}
+
+interface RunProgress {
+  run: number;
+  attempts?: AttemptStatus[];
+  steps?: StepProgress[];
+  final: 'pending' | 'success' | 'failed' | 'skipped';
+}
+
+interface ScenarioProgress {
+  modelId: string;
+  modelName: string;
+  scenario: number;
+  isSequential: boolean;
+  isSkipped?: boolean;
+  runs: RunProgress[];
+  completedRuns: number;
+  totalRuns: number;
 }
 
 interface LogEntry {
@@ -36,14 +60,19 @@ interface LogEntry {
   };
 }
 
-interface RunProgress {
+interface DetailedProgress {
   currentModel: string;
+  currentModelName: string;
   currentScenario: number;
   currentRun: number;
+  currentStep?: number;
+  currentStepName?: string;
   currentAttempt: number;
-  runs: RunAttempts[];
-  totalRuns: number;
-  completedRuns: number;
+  currentStatus: 'running' | 'success' | 'failed' | 'retrying';
+  statusMessage: string;
+  scenarios: ScenarioProgress[];
+  totalScenarios: number;
+  completedScenarios: number;
   maxAttempts: number;
   logEntries: LogEntry[];
 }
@@ -51,7 +80,7 @@ interface RunProgress {
 interface RunStatus {
   id: string;
   status: 'running' | 'complete' | 'cancelled' | 'error';
-  progress: RunProgress;
+  progress: DetailedProgress;
   error?: string;
   summary?: {
     totalTests: number;
@@ -59,17 +88,294 @@ interface RunStatus {
     failed: number;
     successRate: number;
   };
+  results?: {
+    [modelId: string]: {
+      [scenarioNumber: string]: ScenarioResult;
+    };
+  };
+  config?: {
+    models: string[];
+    scenarios: number[];
+    runsPerScenario: number;
+    temperature: number;
+    maxRetries: number;
+  };
 }
 
-const scenarios = [
+const scenarioInfo = [
   { id: 1, name: 'One-shot, Non-strict', description: 'Single request with JSON format in prompt' },
   { id: 2, name: 'One-shot, Strict', description: 'Single request with generateObject' },
   { id: 3, name: 'Sequential, Non-strict', description: 'Multi-step with JSON format in prompt' },
   { id: 4, name: 'Sequential, Strict', description: 'Multi-step with generateObject' },
 ];
 
+function AttemptCell({ status, title }: { status: AttemptStatus; title: string }) {
+  const colors: Record<AttemptStatus, string> = {
+    pending: 'bg-gray-200 dark:bg-gray-700',
+    running: 'bg-blue-500 animate-pulse',
+    failed: 'bg-red-500',
+    success: 'bg-green-500',
+    skipped: 'bg-gray-300 dark:bg-gray-600',
+  };
+  return (
+    <div
+      className={`h-4 flex-1 ${colors[status]} first:rounded-l last:rounded-r`}
+      title={title}
+    />
+  );
+}
+
+function OneShotProgressRow({ run }: { run: RunProgress }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-gray-500 w-10 shrink-0">R{run.run}</span>
+      <div className="flex-1 flex gap-px">
+        {run.attempts?.map((status, idx) => (
+          <AttemptCell
+            key={idx}
+            status={status}
+            title={`Run ${run.run}, Attempt ${idx + 1}: ${status}`}
+          />
+        ))}
+      </div>
+      <span className={`text-xs w-8 text-right ${run.final === 'success' ? 'text-green-600' : run.final === 'failed' ? 'text-red-600' : 'text-gray-400'}`}>
+        {run.final === 'success' ? 'Pass' : run.final === 'failed' ? 'Fail' : '...'}
+      </span>
+    </div>
+  );
+}
+
+function SequentialProgressRow({ run }: { run: RunProgress }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-gray-500 w-10 shrink-0">R{run.run}</span>
+      <div className="flex-1 flex gap-1">
+        {run.steps?.map((step, stepIdx) => (
+          <div key={stepIdx} className="flex-1">
+            <div className="flex gap-px">
+              {step.attempts.map((status, attemptIdx) => (
+                <AttemptCell
+                  key={attemptIdx}
+                  status={status}
+                  title={`Run ${run.run}, Step ${stepIdx + 1} (${step.stepName}), Attempt ${attemptIdx + 1}: ${status}`}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <span className={`text-xs w-8 text-right ${run.final === 'success' ? 'text-green-600' : run.final === 'failed' ? 'text-red-600' : 'text-gray-400'}`}>
+        {run.final === 'success' ? 'Pass' : run.final === 'failed' ? 'Fail' : '...'}
+      </span>
+    </div>
+  );
+}
+
+function ScenarioProgressCard({ scenarioProgress, isCurrent, isStarted }: { scenarioProgress: ScenarioProgress; isCurrent: boolean; isStarted: boolean }) {
+  const hasAnyProgress = scenarioProgress.runs.some(r =>
+    r.final !== 'pending' && r.final !== 'skipped' ||
+    r.attempts?.some(a => a !== 'pending' && a !== 'skipped') ||
+    r.steps?.some(s => s.attempts.some(a => a !== 'pending' && a !== 'skipped'))
+  );
+  const showAsNotStarted = !isStarted && !hasAnyProgress && !scenarioProgress.isSkipped;
+
+  if (scenarioProgress.isSkipped) {
+    return (
+      <div className="border rounded-lg p-3 border-gray-200 dark:border-gray-700 opacity-50 relative">
+        <div className="absolute inset-0 flex items-center justify-center">
+          <span className="text-xs font-medium text-gray-400 dark:text-gray-500 bg-white dark:bg-gray-800 px-2 py-1 rounded">
+            Strict mode not supported
+          </span>
+        </div>
+        <div className="flex items-center justify-between mb-2 opacity-50">
+          <div className="flex items-center gap-2">
+            <span className="font-medium text-sm text-gray-900 dark:text-white">{scenarioProgress.modelName}</span>
+            <ScenarioBadge scenario={scenarioProgress.scenario} />
+          </div>
+          <span className="text-xs text-gray-500">
+            Skipped
+          </span>
+        </div>
+        <div className="h-12"></div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`border rounded-lg p-3 transition-all ${
+      isCurrent
+        ? 'border-blue-500 bg-blue-50/50 dark:bg-blue-900/20'
+        : showAsNotStarted
+          ? 'border-gray-200 dark:border-gray-700 opacity-40'
+          : 'border-gray-200 dark:border-gray-700'
+    }`}>
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="font-medium text-sm text-gray-900 dark:text-white">{scenarioProgress.modelName}</span>
+          <ScenarioBadge scenario={scenarioProgress.scenario} />
+        </div>
+        <span className="text-xs text-gray-500">
+          {scenarioProgress.completedRuns}/{scenarioProgress.totalRuns} runs
+        </span>
+      </div>
+
+      {scenarioProgress.isSequential && (
+        <div className="flex items-center gap-2 mb-1 text-xs text-gray-400">
+          <span className="w-10 shrink-0"></span>
+          <div className="flex-1 flex gap-1">
+            <div className="flex-1 text-center">Step 1</div>
+            <div className="flex-1 text-center">Step 2</div>
+            <div className="flex-1 text-center">Step 3</div>
+          </div>
+          <span className="w-8"></span>
+        </div>
+      )}
+
+      <div className="space-y-0.5">
+        {scenarioProgress.runs.map((run) =>
+          scenarioProgress.isSequential ? (
+            <SequentialProgressRow key={run.run} run={run} />
+          ) : (
+            <OneShotProgressRow key={run.run} run={run} />
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+const scenarioLabelsMap: Record<number, string> = {
+  1: 'One-Shot Non-Strict',
+  2: 'One-Shot Strict',
+  3: 'Sequential Non-Strict',
+  4: 'Sequential Strict',
+};
+
+function calculateRunCost(modelId: string, runResult: RunResult): number {
+  const pricing = modelPricing[modelId];
+  if (!pricing) return 0;
+
+  let totalCost = 0;
+
+  if (runResult.steps) {
+    for (const step of runResult.steps) {
+      for (const attempt of step.attempts) {
+        totalCost += (attempt.inputTokens || 0) * pricing.input;
+        totalCost += (attempt.outputTokens || 0) * pricing.output;
+      }
+    }
+  } else {
+    for (const attempt of runResult.attempts) {
+      totalCost += (attempt.inputTokens || 0) * pricing.input;
+      totalCost += (attempt.outputTokens || 0) * pricing.output;
+    }
+  }
+
+  return totalCost;
+}
+
+function LiveChartsSection({ runStatus, models }: { runStatus: RunStatus; models: Model[] }) {
+  const chartData = useMemo(() => {
+    if (!runStatus.results) return { successRateData: [], scatterData: [] };
+
+    const allData: Array<{
+      modelId: string;
+      modelName: string;
+      scenario: number;
+      result: ScenarioResult;
+    }> = [];
+
+    for (const [modelId, modelResults] of Object.entries(runStatus.results)) {
+      const model = models.find(m => m.id === modelId);
+      if (!model) continue;
+
+      for (const [scenario, result] of Object.entries(modelResults)) {
+        if (result.runs.length > 0) {
+          allData.push({
+            modelId,
+            modelName: model.name,
+            scenario: parseInt(scenario),
+            result,
+          });
+        }
+      }
+    }
+
+    const scenarios = [...new Set(allData.map(d => d.scenario))].sort((a, b) => a - b);
+    const modelIds = [...new Set(allData.map(d => d.modelId))];
+
+    const successRateData = modelIds.map(modelId => {
+      const model = models.find(m => m.id === modelId);
+      const scenarioData: Record<number, { firstAttempt: number; afterRetry1: number; afterRetry2: number; afterRetry3: number }> = {};
+
+      scenarios.forEach(scenario => {
+        const d = allData.find(x => x.modelId === modelId && x.scenario === scenario);
+        if (d) {
+          scenarioData[scenario] = {
+            firstAttempt: d.result.summary.firstAttemptSuccessRate,
+            afterRetry1: d.result.summary.afterRetry1SuccessRate,
+            afterRetry2: d.result.summary.afterRetry2SuccessRate,
+            afterRetry3: d.result.summary.afterRetry3SuccessRate,
+          };
+        }
+      });
+
+      return {
+        modelId,
+        modelName: model?.name || modelId,
+        scenarios: scenarioData,
+      };
+    });
+
+    const scatterData = allData.map(d => {
+      const totalCost = d.result.runs.reduce((sum, run) => sum + calculateRunCost(d.modelId, run), 0);
+      const avgCost = d.result.runs.length > 0 ? totalCost / d.result.runs.length : 0;
+      const avgTime = d.result.summary.averageDurationMs / 1000;
+
+      return {
+        modelId: d.modelId,
+        modelName: d.modelName,
+        scenario: d.scenario,
+        scenarioLabel: scenarioLabelsMap[d.scenario],
+        timeSeconds: avgTime,
+        costDollars: avgCost,
+        efficiency: avgTime > 0 ? avgCost / avgTime : 0,
+        tokens: Math.round(d.result.summary.averageTokensPerSuccess || 0),
+      };
+    });
+
+    return { successRateData, scatterData, scenarios };
+  }, [runStatus.results, models]);
+
+  if (chartData.successRateData.length === 0) return null;
+
+  return (
+    <>
+      <Card className="p-6">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+          Live Success Rates
+        </h2>
+        <SuccessRateChart
+          data={chartData.successRateData}
+          scenariosToShow={chartData.scenarios || []}
+        />
+      </Card>
+
+      {chartData.scatterData.length > 0 && chartData.scatterData.some(d => d.timeSeconds > 0) && (
+        <Card className="p-6">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+            Live Cost vs Time
+          </h2>
+          <CostTimeScatterChart data={chartData.scatterData} />
+        </Card>
+      )}
+    </>
+  );
+}
+
 export default function RunTestsPage() {
   const router = useRouter();
+  const { getHeaders } = useApiKeys();
   const [models, setModels] = useState<Model[]>([]);
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set());
   const [selectedScenarios, setSelectedScenarios] = useState<Set<number>>(new Set([1, 2, 3, 4]));
@@ -79,22 +385,33 @@ export default function RunTestsPage() {
   const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch available models
   useEffect(() => {
     fetch('/api/models')
       .then((res) => res.json())
       .then((data) => {
         setModels(data.models);
-        // Select all models by default
         setSelectedModels(new Set(data.models.map((m: Model) => m.id)));
       })
       .catch((err) => {
         setError('Failed to load models');
         console.error(err);
       });
+
+    fetch('/api/run')
+      .then((res) => res.json())
+      .then((data) => {
+        const runningRun = data.runs?.find((r: { status: string }) => r.status === 'running');
+        if (runningRun) {
+          setRunId(runningRun.id);
+          setIsRunning(true);
+          setRunStatus(runningRun);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to check for active runs:', err);
+      });
   }, []);
 
-  // Poll for run status
   useEffect(() => {
     if (!runId || !isRunning) return;
 
@@ -106,7 +423,6 @@ export default function RunTestsPage() {
 
         if (status.status === 'complete') {
           setIsRunning(false);
-          // Navigate to results after a short delay
           setTimeout(() => {
             router.push(`/results/${runId}`);
           }, 1500);
@@ -119,7 +435,7 @@ export default function RunTestsPage() {
       } catch (err) {
         console.error('Error polling status:', err);
       }
-    }, 1000);
+    }, 500);
 
     return () => clearInterval(interval);
   }, [runId, isRunning, router]);
@@ -167,9 +483,13 @@ export default function RunTestsPage() {
     setRunStatus(null);
 
     try {
+      const apiKeyHeaders = getHeaders();
       const res = await fetch('/api/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...apiKeyHeaders,
+        },
         body: JSON.stringify({
           models: Array.from(selectedModels),
           scenarios: Array.from(selectedScenarios),
@@ -178,7 +498,8 @@ export default function RunTestsPage() {
       });
 
       if (!res.ok) {
-        throw new Error('Failed to start test run');
+        const data = await res.json();
+        throw new Error(data.error || 'Failed to start test run');
       }
 
       const data = await res.json();
@@ -200,7 +521,6 @@ export default function RunTestsPage() {
     }
   };
 
-  // Group models by provider
   const modelsByProvider = models.reduce((acc, model) => {
     if (!acc[model.provider]) {
       acc[model.provider] = [];
@@ -217,19 +537,20 @@ export default function RunTestsPage() {
         <h1 className="text-3xl font-bold text-gray-900 dark:text-white">
           Run Tests
         </h1>
-        <p className="text-gray-600 dark:text-gray-400 mt-1">
-          Configure and run structured output benchmarks
-        </p>
       </div>
 
       {error && (
         <div className="bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg p-4 text-red-700 dark:text-red-300">
           {error}
+          {error.includes('API keys') && (
+            <Link href="/settings" className="ml-2 underline hover:no-underline">
+              Go to Settings
+            </Link>
+          )}
         </div>
       )}
 
-      {/* Progress Display */}
-      {isRunning && runStatus && runStatus.progress?.runs && (
+      {isRunning && runStatus && runStatus.progress?.scenarios && (
         <Card className="p-6">
           <div className="space-y-4">
             <div className="flex items-center justify-between">
@@ -241,74 +562,90 @@ export default function RunTestsPage() {
               </Button>
             </div>
 
-            <div className="space-y-3">
-              <div className="flex justify-between text-sm text-gray-600 dark:text-gray-400">
-                <span>
-                  {runStatus.progress.currentModel} • Scenario {runStatus.progress.currentScenario}
-                </span>
-                <span>
-                  {runStatus.progress.completedRuns} / {runStatus.progress.totalRuns} runs complete
-                </span>
-              </div>
+            <div className="flex justify-between text-sm text-gray-600 dark:text-gray-400">
+              <span>
+                {runStatus.progress.completedScenarios} / {runStatus.progress.totalScenarios} scenarios complete
+              </span>
+              <span>
+                Run {runStatus.progress.currentRun}
+                {runStatus.progress.currentStep && ` • Step ${runStatus.progress.currentStep}`}
+                {' '}• Attempt {runStatus.progress.currentAttempt}
+              </span>
+            </div>
 
-              {/* Segmented progress bar */}
-              <div className="flex gap-0.5">
-                {runStatus.progress.runs.map((run) => (
-                  <div key={run.run} className="flex-1 flex gap-px">
-                    {run.attempts.map((attempt, attemptIdx) => {
-                      const colors: Record<AttemptStatus, string> = {
-                        pending: 'bg-gray-200 dark:bg-gray-700',
-                        running: 'bg-blue-500 animate-pulse',
-                        failed: 'bg-red-500',
-                        success: 'bg-green-500',
-                        skipped: 'bg-gray-300 dark:bg-gray-600',
-                      };
-                      return (
-                        <div
-                          key={attemptIdx}
-                          className={`h-6 flex-1 ${colors[attempt]} ${attemptIdx === 0 ? 'rounded-l' : ''} ${attemptIdx === runStatus.progress.maxAttempts - 1 ? 'rounded-r' : ''}`}
-                          title={`Run ${run.run}, Attempt ${attemptIdx + 1}: ${attempt}`}
-                        />
-                      );
-                    })}
-                  </div>
-                ))}
-              </div>
+            {/* Status chyron */}
+            <div className={`px-4 py-2 rounded-lg text-sm font-medium ${
+              runStatus.progress.currentStatus === 'running' ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300' :
+              runStatus.progress.currentStatus === 'retrying' ? 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300' :
+              runStatus.progress.currentStatus === 'success' ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300' :
+              'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
+            }`}>
+              {runStatus.progress.statusMessage}
+            </div>
 
-              {/* Legend */}
-              <div className="flex gap-4 text-xs text-gray-500 dark:text-gray-400">
-                <div className="flex items-center gap-1">
-                  <div className="w-3 h-3 bg-green-500 rounded" />
-                  <span>Success</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <div className="w-3 h-3 bg-red-500 rounded" />
-                  <span>Failed attempt</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <div className="w-3 h-3 bg-blue-500 rounded" />
-                  <span>Running</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <div className="w-3 h-3 bg-gray-300 dark:bg-gray-600 rounded" />
-                  <span>Skipped</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <div className="w-3 h-3 bg-gray-200 dark:bg-gray-700 rounded" />
-                  <span>Pending</span>
-                </div>
-              </div>
+            {(() => {
+              const uniqueScenarios = [...new Set(runStatus.progress.scenarios.map(s => s.scenario))];
+              const numScenarios = uniqueScenarios.length;
+              const gridCols = numScenarios === 1 ? 'grid-cols-1' :
+                               numScenarios === 2 ? 'grid-cols-2' :
+                               numScenarios === 3 ? 'grid-cols-3' :
+                               'grid-cols-4';
 
-              {/* Current activity */}
-              <div className="text-sm text-gray-600 dark:text-gray-400">
-                Run {runStatus.progress.currentRun}, Attempt {runStatus.progress.currentAttempt}
+              const scenarioOrder = runStatus.progress.scenarios.reduce((acc, s, idx) => {
+                const key = `${s.modelId}-${s.scenario}`;
+                if (!(key in acc)) acc[key] = idx;
+                return acc;
+              }, {} as Record<string, number>);
+
+              const currentIdx = scenarioOrder[`${runStatus.progress.currentModel}-${runStatus.progress.currentScenario}`] ?? 0;
+
+              return (
+                <div className={`grid ${gridCols} gap-3 max-h-[60vh] overflow-y-auto`}>
+                  {runStatus.progress.scenarios.map((sp) => {
+                    const idx = scenarioOrder[`${sp.modelId}-${sp.scenario}`] ?? 0;
+                    const isCurrent = sp.modelId === runStatus.progress.currentModel && sp.scenario === runStatus.progress.currentScenario;
+                    const isStarted = idx <= currentIdx;
+
+                    return (
+                      <ScenarioProgressCard
+                        key={`${sp.modelId}-${sp.scenario}`}
+                        scenarioProgress={sp}
+                        isCurrent={isCurrent}
+                        isStarted={isStarted}
+                      />
+                    );
+                  })}
+                </div>
+              );
+            })()}
+
+            <div className="flex gap-4 text-xs text-gray-500 dark:text-gray-400">
+              <div className="flex items-center gap-1">
+                <div className="w-3 h-3 bg-green-500 rounded" />
+                <span>Success</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-3 h-3 bg-red-500 rounded" />
+                <span>Failed</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-3 h-3 bg-blue-500 rounded" />
+                <span>Running</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-3 h-3 bg-gray-300 dark:bg-gray-600 rounded" />
+                <span>Skipped</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-3 h-3 bg-gray-200 dark:bg-gray-700 rounded" />
+                <span>Pending</span>
               </div>
             </div>
 
             {runStatus.status === 'complete' && runStatus.summary && (
               <div className="flex items-center gap-4 pt-2">
                 <span className="text-green-600 dark:text-green-400 font-medium">
-                  ✓ Complete!
+                  Complete!
                 </span>
                 <SuccessRate value={runStatus.summary.successRate} />
                 <span className="text-gray-500 text-sm">
@@ -317,7 +654,6 @@ export default function RunTestsPage() {
               </div>
             )}
 
-            {/* Activity Log */}
             <div className="mt-4">
               <ActivityLog
                 entries={runStatus.progress.logEntries || []}
@@ -329,10 +665,12 @@ export default function RunTestsPage() {
         </Card>
       )}
 
-      {/* Configuration */}
+      {isRunning && runStatus?.results && Object.keys(runStatus.results).length > 0 && (
+        <LiveChartsSection runStatus={runStatus} models={models} />
+      )}
+
       {!isRunning && (
         <>
-          {/* Models Selection */}
           <Card className="p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
@@ -386,13 +724,12 @@ export default function RunTestsPage() {
             </div>
           </Card>
 
-          {/* Scenarios Selection */}
           <Card className="p-6">
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
               Scenarios
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {scenarios.map((scenario) => (
+              {scenarioInfo.map((scenario) => (
                 <label
                   key={scenario.id}
                   className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
@@ -423,7 +760,6 @@ export default function RunTestsPage() {
             </div>
           </Card>
 
-          {/* Configuration Options */}
           <Card className="p-6">
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
               Configuration
@@ -443,14 +779,13 @@ export default function RunTestsPage() {
             </div>
           </Card>
 
-          {/* Summary and Run Button */}
           <Card className="p-6">
             <div className="flex items-center justify-between">
               <div className="text-gray-600 dark:text-gray-400">
                 <span className="font-semibold text-gray-900 dark:text-white">
                   {totalTests}
                 </span>{' '}
-                total tests ({selectedModels.size} models × {selectedScenarios.size} scenarios × {runsPerScenario} runs)
+                total tests ({selectedModels.size} models x {selectedScenarios.size} scenarios x {runsPerScenario} runs)
               </div>
               <Button
                 size="lg"
